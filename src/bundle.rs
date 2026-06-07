@@ -115,12 +115,13 @@ impl Bundle {
     /// file shape, any depth) so `usagi.read_json` / `usagi.read_text`
     /// resolve identically in dev and exported builds.
     ///
-    /// Lua files are stripped of comments to reduce bundle size and
-    /// make exported code less readable when opened in a text editor.
+    /// Lua files are obfuscated (comments stripped, whitespace minimised,
+    /// local variables renamed) to reduce bundle size and make exported
+    /// code harder to read when opened in a text editor.
     pub fn from_project(script_path: &Path) -> io::Result<Self> {
         let mut bundle = Self::new();
         let main_lua_bytes = std::fs::read(script_path)?;
-        let minified_main = crate::lua_minify::strip_comments(&main_lua_bytes);
+        let minified_main = crate::lua_minify::obfuscate(&main_lua_bytes);
         bundle.insert("main.lua", minified_main);
 
         let root = script_path.parent().unwrap_or_else(|| Path::new("."));
@@ -144,7 +145,7 @@ impl Bundle {
             if crate::vfs::is_meta_chunk(&bytes) {
                 continue;
             }
-            let minified = crate::lua_minify::strip_comments(&bytes);
+            let minified = crate::lua_minify::obfuscate(&bytes);
             bundle.insert(rel, minified);
         }
 
@@ -390,7 +391,7 @@ mod tests {
         let bundle = Bundle::from_project(&root.join("main.lua")).unwrap();
         assert_eq!(
             bundle.get("main.lua"),
-            Some(b"function _init() end".as_slice())
+            Some(b"function _init()end".as_slice())
         );
         assert_eq!(bundle.get("sprites.png"), Some(b"fake png".as_slice()));
         assert!(bundle.get("sfx/jump.wav").is_some());
@@ -437,7 +438,7 @@ mod tests {
         let bundle = Bundle::from_project(&root.join("main.lua")).unwrap();
         assert!(bundle.get("meta/usagi.lua").is_none());
         assert!(bundle.get("local_stubs.lua").is_none());
-        assert_eq!(bundle.get("util.lua"), Some(b"return {}".as_slice()));
+        assert_eq!(bundle.get("util.lua"), Some(b"return{}".as_slice()));
     }
 
     #[test]

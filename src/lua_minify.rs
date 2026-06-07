@@ -1,223 +1,176 @@
-//! Lua source code minification: strips comments and optionally obfuscates.
+//! Lua source obfuscation for bundle exports.
 //!
-//! Removes all Lua comments (single-line `--` and block `--[[ ... ]]`)
-//! while preserving string literals and code structure. This reduces
-//! bundle size and makes exported game code less readable when opened
-//! in a text editor.
+//! Thin wrapper around `darklua_core`. Single public entry point:
+//!
+//! - [`obfuscate`]  — strip comments + whitespace + rename locals
+//!
+//! Obfuscation preserves:
+//! - Lua standard globals (`print`, `pairs`, `math.*`, …)
+//! - Engine table names: `usagi`, `gfx`, `sfx`
+//! - Other globals automatically detected at call sites
+//! - String contents, number literals, table keys
 
-/// Strip all comments from Lua source (both single-line and block comments).
-/// Preserves strings and code structure exactly; only removes comment text.
-pub fn strip_comments(src: &[u8]) -> Vec<u8> {
+use darklua_core::generator::{LuaGenerator, TokenBasedLuaGenerator};
+use darklua_core::rules::{
+    ContextBuilder, FlawlessRule, RemoveComments, RemoveSpaces, RenameVariables,
+};
+use darklua_core::Resources;
+
+fn obfuscate_full(src: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(src) else {
         return src.to_vec();
     };
 
-    let mut out = String::with_capacity(src.len());
-    let mut chars = text.chars().peekable();
+    let parser = darklua_core::Parser::default().preserve_tokens();
+    let mut block = match parser.parse(text) {
+        Ok(b) => b,
+        Err(_) => return src.to_vec(),
+    };
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            // Potential comment start
-            '-' if chars.peek() == Some(&'-') => {
-                chars.next(); // consume second `-`
+    let resources = Resources::from_memory();
+    let ctx = ContextBuilder::new("input.lua", &resources, text).build();
 
-                // Check if this is a block comment `--[` or `--[[`
-                if chars.peek() == Some(&'[') {
-                    if let Some(level) = peek_long_bracket_level(&mut chars.clone()) {
-                        // Block comment: skip the opening `[...[`
-                        chars.next(); // consume `[`
-                        for _ in 0..level {
-                            chars.next(); // consume `=` signs
-                        }
-                        chars.next(); // consume final `[`
+    // 1. Strip comments
+    RemoveComments::default().flawless_process(&mut block, &ctx);
 
-                        // Skip everything until we find the closing `]....]`
-                        while let Some(c) = chars.next() {
-                            if c == ']' && is_closing_bracket(&mut chars.clone(), level) {
-                                // Consume the closing bracket sequence
-                                for _ in 0..level {
-                                    chars.next();
-                                }
-                                chars.next(); // consume final `]`
-                                break;
-                            }
-                        }
-                    } else {
-                        // Not a block comment, just a regular `--[` comment
-                        // Skip to end of line
-                        while chars.peek() != Some(&'\n') && chars.peek().is_some() {
-                            chars.next();
-                        }
-                    }
-                } else {
-                    // Regular short comment `--`
-                    // Skip until end of line
-                    while chars.peek() != Some(&'\n') && chars.peek().is_some() {
-                        chars.next();
-                    }
-                }
-            }
+    // 2. Strip excessive whitespace
+    RemoveSpaces::default().flawless_process(&mut block, &ctx);
 
-            // Short string literals
-            '"' | '\'' => {
-                let quote = ch;
-                out.push(ch);
+    // 3. Rename local variables to short anonymous identifiers.
+    // These tables are provided by the engine at runtime and must keep
+    // their original names.  Everything else referenced as a global
+    // but never declared with `local` in this file (including Lua
+    // builtins like `print`, `pairs`, `math` and user callbacks like
+    // `_init`, `_update`, `_draw`) is auto-detected by darklua's
+    // `detect_globals` (default: true).
+    let globals: Vec<String> = ["usagi", "gfx", "sfx"].map(String::from).to_vec();
+    RenameVariables::new(globals)
+        .with_function_names()
+        .flawless_process(&mut block, &ctx);
 
-                // Copy string content until closing quote
-                while let Some(c) = chars.next() {
-                    out.push(c);
-                    if c == '\\' && chars.peek().is_some() {
-                        // Escape sequence: consume next char
-                        if let Some(escaped) = chars.next() {
-                            out.push(escaped);
-                        }
-                    } else if c == quote {
-                        break;
-                    }
-                }
-            }
+    let mut generator = TokenBasedLuaGenerator::new(text);
+    generator.write_block(&block);
+    let mut out = generator.into_string();
 
-            // Long string literals `[[ ... ]]` or `[=[ ... ]=]`
-            '[' if peek_long_bracket_level(&mut chars.clone()).is_some() => {
-                out.push(ch);
-                if let Some(level) = peek_long_bracket_level(&mut chars.clone()) {
-                    // Consume the opening `[...[`
-                    for _ in 0..level {
-                        if let Some(c) = chars.next() {
-                            out.push(c);
-                        }
-                    }
-                    if let Some(c) = chars.next() {
-                        out.push(c); // closing `[`
-                    }
-
-                    // Copy until we find the closing `]......]`
-                    while let Some(c) = chars.next() {
-                        out.push(c);
-                        if c == ']' && is_closing_bracket(&mut chars.clone(), level) {
-                            // Consume the closing bracket sequence
-                            for _ in 0..level {
-                                if let Some(eq) = chars.next() {
-                                    out.push(eq);
-                                }
-                            }
-                            if let Some(closing) = chars.next() {
-                                out.push(closing); // closing `]`
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Everything else: copy as-is
-            _ => {
-                out.push(ch);
-            }
-        }
+    // Drop lines that are empty or whitespace-only (orphaned from
+    // comment-only lines after comment removal).
+    let trailing_nl = out.ends_with('\n');
+    let filtered: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    out = filtered.join("\n");
+    if trailing_nl && !out.is_empty() {
+        out.push('\n');
     }
 
     out.into_bytes()
 }
 
-/// Peek ahead to detect long bracket syntax (`[`, `[=`, `[==`, etc.)
-/// Returns Some(level) with number of `=` signs, or None if not a long bracket.
-fn peek_long_bracket_level(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<usize> {
-    let mut temp = chars.clone();
-    let mut level = 0;
-
-    while let Some(&ch) = temp.peek() {
-        if ch == '=' {
-            level += 1;
-            temp.next();
-        } else if ch == '[' {
-            temp.next();
-            return Some(level);
-        } else {
-            return None;
-        }
-    }
-    None
+/// Obfuscate Lua source: strip comments, remove whitespace, rename local
+/// variables to short anonymous identifiers.
+///
+/// Non-UTF-8 input is returned unchanged.
+pub fn obfuscate(src: &[u8]) -> Vec<u8> {
+    obfuscate_full(src)
 }
 
-/// Check if we're at a closing bracket sequence `]`, `]=`, `]==`, etc.
-fn is_closing_bracket(chars: &mut std::iter::Peekable<std::str::Chars>, level: usize) -> bool {
-    let mut temp = chars.clone();
-    for _ in 0..level {
-        if temp.next() != Some('=') {
-            return false;
-        }
-    }
-    temp.next() == Some(']')
-}
+// ---------------------------------------------------------------------------
+// Tests — small integration checks
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn strip_comments_removes_single_line_comments() {
-        let src = b"x = 1 -- this is a comment\ny = 2\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(!text.contains("--"));
-        assert!(text.contains("x = 1"));
-        assert!(text.contains("y = 2"));
+    fn obfuscate_renames_locals() {
+        let src = b"local x = 1\nprint(x)\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(!t.contains("x ="), "local should be renamed, got: {t:?}");
     }
 
     #[test]
-    fn strip_comments_removes_block_comments() {
-        let src = b"x = 1 --[[ block comment ]] y = 2\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(!text.contains("block comment"));
-        assert!(text.contains("x = 1"));
-        assert!(text.contains("y = 2"));
+    fn obfuscate_preserves_globals() {
+        let src = b"local x = 1\nprint(x)\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(t.contains("print("), "global function preserved: {t:?}");
     }
 
     #[test]
-    fn strip_comments_preserves_strings() {
-        let src = b"s = \"x = 1 -- not a comment\"\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(text.contains("-- not a comment"));
+    fn obfuscate_preserves_engine_tables() {
+        let src = b"usagi.draw_text(0, 0, 'hello')\ngfx.clear(6)\nsfx.play(0)\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(t.contains("usagi"), "usagi table preserved: {t:?}");
+        assert!(t.contains("gfx."), "gfx table preserved: {t:?}");
+        assert!(t.contains("sfx."), "sfx table preserved: {t:?}");
     }
 
     #[test]
-    fn strip_comments_preserves_long_strings() {
-        let src = b"s = [[ x = 1 -- [[ not nested ]] ]] y = 2\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(text.contains("x = 1"));
-        assert!(text.contains("not nested"));
+    fn obfuscate_preserves_lua_builtins() {
+        let src = b"local t = {1, 2, 3}\nfor i, v in ipairs(t) do print(i, v) end\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(t.contains("ipairs("), "ipairs preserved: {t:?}");
+        assert!(t.contains("print("), "print preserved: {t:?}");
     }
 
     #[test]
-    fn strip_comments_handles_multiline_block_comments() {
-        let src = b"--[[\nmultiline\ncomment\n]]\nx = 1\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(!text.contains("multiline"));
-        assert!(!text.contains("comment"));
-        assert!(text.contains("x = 1"));
+    fn obfuscate_handles_local_function() {
+        let src = b"local function f(x) return x end\nprint(f(1))\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(!t.contains("local function f"));
+        assert!(t.contains("print("));
     }
 
     #[test]
-    fn strip_comments_handles_leveled_brackets() {
-        let src = b"x = --[=[ comment ]=] 1\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(!text.contains("comment"));
-        assert!(text.contains("x = 1"));
+    fn obfuscate_handles_for_loop_vars() {
+        let src = b"for i = 1, 10 do print(i) end\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(t.contains("print("));
     }
 
     #[test]
-    fn strip_comments_preserves_function_definitions() {
-        let src = b"function test() -- comment\n  return 42 -- another\nend\n";
-        let result = strip_comments(src);
-        let text = std::str::from_utf8(&result).unwrap();
-        assert!(text.contains("function test()"));
-        assert!(text.contains("return 42"));
-        assert!(!text.contains("comment"));
+    fn obfuscate_preserves_string_content() {
+        let src = b"local msg = 'hello world'\nprint(msg)\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(t.contains("hello world"), "string content preserved: {t:?}");
+    }
+
+    #[test]
+    fn non_utf8_passthrough() {
+        let src = b"\xff\xfe\x00\x01";
+        let out = obfuscate(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn obfuscate_strips_comments() {
+        let src = b"local x = 1 -- this is a comment\nprint(x) --[[ block ]]\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(!t.contains("comment"), "comments stripped: {t:?}");
+    }
+
+    #[test]
+    fn obfuscate_drops_comment_only_lines() {
+        let src = b" -- main\nx = 1\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(!t.starts_with('\n'), "no leading newline from comment-only line: {t:?}");
+        assert!(t.contains("x=1") || t.contains("x ="));
+    }
+
+    #[test]
+    fn obfuscate_drops_comment_only_lines_multi() {
+        let src = b"  -- main\n  -- setup\nx = 1\n";
+        let out = obfuscate(src);
+        let t = std::str::from_utf8(&out).unwrap();
+        assert!(!t.starts_with('\n'), "no leading newlines from comment-only lines: {t:?}");
+        let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "only code lines remain: {t:?}");
     }
 }
