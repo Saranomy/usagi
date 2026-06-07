@@ -10,11 +10,11 @@
 //! - Other globals automatically detected at call sites
 //! - String contents, number literals, table keys
 
+use darklua_core::Resources;
 use darklua_core::generator::{LuaGenerator, TokenBasedLuaGenerator};
 use darklua_core::rules::{
     ContextBuilder, FlawlessRule, RemoveComments, RemoveSpaces, RenameVariables,
 };
-use darklua_core::Resources;
 
 fn obfuscate_full(src: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(src) else {
@@ -160,7 +160,10 @@ mod tests {
         let src = b" -- main\nx = 1\n";
         let out = obfuscate(src);
         let t = std::str::from_utf8(&out).unwrap();
-        assert!(!t.starts_with('\n'), "no leading newline from comment-only line: {t:?}");
+        assert!(
+            !t.starts_with('\n'),
+            "no leading newline from comment-only line: {t:?}"
+        );
         assert!(t.contains("x=1") || t.contains("x ="));
     }
 
@@ -169,7 +172,10 @@ mod tests {
         let src = b"  -- main\n  -- setup\nx = 1\n";
         let out = obfuscate(src);
         let t = std::str::from_utf8(&out).unwrap();
-        assert!(!t.starts_with('\n'), "no leading newlines from comment-only lines: {t:?}");
+        assert!(
+            !t.starts_with('\n'),
+            "no leading newlines from comment-only lines: {t:?}"
+        );
         let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(lines.len(), 1, "only code lines remain: {t:?}");
     }
