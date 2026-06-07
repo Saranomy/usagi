@@ -114,9 +114,14 @@ impl Bundle {
     /// recognized `music/*` files, and the entire `data/` tree (any
     /// file shape, any depth) so `usagi.read_json` / `usagi.read_text`
     /// resolve identically in dev and exported builds.
+    ///
+    /// Lua files are stripped of comments to reduce bundle size and
+    /// make exported code less readable when opened in a text editor.
     pub fn from_project(script_path: &Path) -> io::Result<Self> {
         let mut bundle = Self::new();
-        bundle.insert("main.lua", std::fs::read(script_path)?);
+        let main_lua_bytes = std::fs::read(script_path)?;
+        let minified_main = crate::lua_minify::strip_comments(&main_lua_bytes);
+        bundle.insert("main.lua", minified_main);
 
         let root = script_path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -139,7 +144,8 @@ impl Bundle {
             if crate::vfs::is_meta_chunk(&bytes) {
                 continue;
             }
-            bundle.insert(rel, bytes);
+            let minified = crate::lua_minify::strip_comments(&bytes);
+            bundle.insert(rel, minified);
         }
 
         let sprites = root.join("sprites.png");
@@ -405,9 +411,9 @@ mod tests {
         fs::write(root.join(".zed/secret.lua"), b"-- secret").unwrap();
 
         let bundle = Bundle::from_project(&root.join("main.lua")).unwrap();
-        assert_eq!(bundle.get("main.lua"), Some(b"-- main".as_slice()));
-        assert_eq!(bundle.get("enemies.lua"), Some(b"-- enemies".as_slice()));
-        assert_eq!(bundle.get("world/tiles.lua"), Some(b"-- tiles".as_slice()));
+        assert_eq!(bundle.get("main.lua"), Some(b"".as_slice()));
+        assert_eq!(bundle.get("enemies.lua"), Some(b"".as_slice()));
+        assert_eq!(bundle.get("world/tiles.lua"), Some(b"".as_slice()));
         assert!(bundle.get(".zed/secret.lua").is_none());
     }
 
@@ -445,12 +451,12 @@ mod tests {
         fs::write(root.join("util.lua"), b"-- util").unwrap();
 
         let bundle = Bundle::from_project(&root.join("game.lua")).unwrap();
-        assert_eq!(bundle.get("main.lua"), Some(b"-- game".as_slice()));
+        assert_eq!(bundle.get("main.lua"), Some(b"".as_slice()));
         assert!(
             bundle.get("game.lua").is_none(),
             "entry script should not be double-inserted under its source name"
         );
-        assert_eq!(bundle.get("util.lua"), Some(b"-- util".as_slice()));
+        assert_eq!(bundle.get("util.lua"), Some(b"".as_slice()));
     }
 
     #[test]
@@ -481,7 +487,7 @@ mod tests {
         fs::write(root.join("game.lua"), b"-- minimal").unwrap();
 
         let bundle = Bundle::from_project(&root.join("game.lua")).unwrap();
-        assert_eq!(bundle.get("main.lua"), Some(b"-- minimal".as_slice()));
+        assert_eq!(bundle.get("main.lua"), Some(b"".as_slice()));
         assert!(bundle.get("sprites.png").is_none());
         assert_eq!(bundle.file_count(), 1);
     }
