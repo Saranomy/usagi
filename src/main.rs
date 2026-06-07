@@ -27,6 +27,7 @@ mod icon;
 mod input;
 #[cfg(not(target_os = "emscripten"))]
 mod loveify;
+mod lua_minify;
 mod msg;
 mod palette;
 mod pause;
