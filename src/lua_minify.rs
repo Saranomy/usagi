@@ -12,7 +12,7 @@ pub fn strip_comments(src: &[u8]) -> Vec<u8> {
         return src.to_vec();
     };
 
-    let mut out = Vec::with_capacity(src.len());
+    let mut out = String::with_capacity(src.len());
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -112,12 +112,12 @@ pub fn strip_comments(src: &[u8]) -> Vec<u8> {
 
             // Everything else: copy as-is
             _ => {
-                out.push(ch as u8);
+                out.push(ch);
             }
         }
     }
 
-    out
+    out.into_bytes()
 }
 
 /// Peek ahead to detect long bracket syntax (`[`, `[=`, `[==`, etc.)
